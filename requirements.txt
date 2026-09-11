@@ -1,0 +1,16 @@
+pandas
+numpy
+matplotlib
+seaborn
+pyyaml
+geopandas
+shapely
+libpysal
+esda
+scipy
+hdbscan
+statsmodels
+mlxtend
+networkx
+pyinform
+pyecharts

@@ -1,0 +1,42 @@
+# Global Configuration for MC-STM (Maritime Cybersecurity Spatio-Temporal Modeling)
+
+data:
+  raw_path: "data/output.csv"
+  processed_path: "output/processed_data.csv"
+  start_year: 2001
+  geographic_normalization:
+    merge_china: ["Hong Kong", "Macau", "Taiwan"]
+    target_name: "China"
+
+analysis:
+  descriptive:
+    top_n: 10
+  temporal:
+    forecast_months: 6
+    glm_family: "Poisson"
+    stability_seeds: [0, 1, 42, 123, 2025]
+    stability_permutations: [500]
+    reference_permutations: 500
+  spatial:
+    knn_k: 9
+    crs: "EPSG:3857" # Web Mercator for metric distance
+  clustering:
+    min_cluster_size: 40
+    min_samples: 30
+  association:
+     min_support: 0.15
+     min_confidence: 0.6
+     min_lift: 1
+     association_comparison_baseline: 1
+
+visualization:
+  font_family: "Times New Roman"
+  font_size: 16
+  color_primary: "#1f77b4"
+  show_spines: [false, false, true, true] # top, right, bottom, left (academic style: remove top/right)
+  dpi: 300
+  format: "png"
+
+output:
+  dir: "output"
+  plots_dir: "output/plots"
