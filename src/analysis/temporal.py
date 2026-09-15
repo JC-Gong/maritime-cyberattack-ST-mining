@@ -64,13 +64,22 @@ def monte_carlo_test(data, k=1, num_permutations=500, seed=0):
                         te_permuted[t] = te.transfer_entropy(x_vals, y_perm.astype(int), k=k)
                     except Exception:
                         te_permuted[t] = 0
-                p_value_mat[i, j] = np.mean(te_permuted >= te_original)
+                r = int(np.sum(te_permuted >= te_original))
+                p_value_mat[i, j] = (r + 1) / (num_permutations + 1)
     return pd.DataFrame(p_value_mat, index=cols, columns=cols)
 
 
 def _run_mc_config(ts_df, perms, seed, k=1):
     p = monte_carlo_test(ts_df, k=k, num_permutations=perms, seed=seed)
     return (perms, seed, p)
+
+
+def _distance_weighted_betweenness(G):
+    H = G.copy()
+    for _, _, d in H.edges(data=True):
+        w = d.get('weight', 0.0)
+        d['distance'] = 1.0 / w if w > 0 else float('inf')
+    return nx.betweenness_centrality(H, weight='distance')
 
 
 class TemporalAnalysis:
@@ -142,7 +151,7 @@ class TemporalAnalysis:
                     G.add_edge(i + 1, j + 1, weight=weight)
         out_s = pd.Series(dict(G.out_degree(weight='weight'))).sort_index()
         in_s = pd.Series(dict(G.in_degree(weight='weight'))).sort_index()
-        betweenness_s = pd.Series(nx.betweenness_centrality(G, weight='weight')).sort_index()
+        betweenness_s = pd.Series(_distance_weighted_betweenness(G)).sort_index()
         return {
             'te_matrix': te_df,
             'p_values': p_value_df,

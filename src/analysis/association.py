@@ -5,6 +5,22 @@ import networkx as nx
 import logging
 
 
+def _distance_weighted_betweenness(G):
+    H = G.copy()
+    for _, _, d in H.edges(data=True):
+        w = d.get('weight', 0.0)
+        d['distance'] = 1.0 / w if w > 0 else float('inf')
+    return nx.betweenness_centrality(H, weight='distance')
+
+
+def _distance_weighted_edge_betweenness(G):
+    H = G.copy()
+    for _, _, d in H.edges(data=True):
+        w = d.get('weight', 0.0)
+        d['distance'] = 1.0 / w if w > 0 else float('inf')
+    return nx.edge_betweenness_centrality(H, weight='distance')
+
+
 class AssociationAnalysis:
 
     def __init__(self, config: dict):
@@ -46,8 +62,8 @@ class AssociationAnalysis:
                 G.add_edge(node_mapping[ant], node_mapping[con], weight=row['confidence'])
             out_s = pd.Series(dict(G.out_degree(weight='weight'))).sort_index()
             in_s = pd.Series(dict(G.in_degree(weight='weight'))).sort_index()
-            betweenness_s = pd.Series(nx.betweenness_centrality(G, weight='weight')).sort_index()
-            edge_betweenness = nx.edge_betweenness_centrality(G, weight='weight')
+            betweenness_s = pd.Series(_distance_weighted_betweenness(G)).sort_index()
+            edge_betweenness = _distance_weighted_edge_betweenness(G)
             top_edges = sorted(edge_betweenness.items(), key=lambda x: x[1], reverse=True)[:20]
             return {
                 'rules': rules,
