@@ -1,220 +1,336 @@
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
+import matplotlib.pyplot as plt
 import networkx as nx
 import pyinform.transferentropy as te
+from ..utils.visualizer import AcademicVisualizer
 import logging
 import os
 
-
-def build_te_series(df):
-    columns = ['Target', 'Asset exploited', 'Cyber threats', 'Consequence severity', 'Consequence type', 'Intent', 'Origin']
-    years = np.arange(2010, 2026)
-    data_filtered = df[(df['Year'] >= 2010) & (df['Year'] <= 2025)].copy()
-    series_dict = {}
-    for col in columns:
-        if col not in data_filtered.columns:
-            continue
-        categories = data_filtered[col].value_counts().index
-        for cat in categories:
-            series_dict[f'{col}-{cat}'] = data_filtered[data_filtered[col] == cat]['Year'].value_counts().sort_index().reindex(years, fill_value=0)
-    ts_df = pd.DataFrame(series_dict)
-    if ts_df.empty:
-        return ts_df
-    ts_df['All'] = data_filtered['Year'].value_counts().sort_index().reindex(years, fill_value=0)
-    return ts_df
-
-
-def transfer_entropy_matrix(data, k=1):
-    cols = data.columns
-    n = len(cols)
-    te_mat = np.zeros((n, n))
-    for i, xi in enumerate(cols):
-        for j, yj in enumerate(cols):
-            if i != j:
-                x = data[xi].values.astype(int)
-                y = data[yj].values.astype(int)
-                if np.any(x) and np.any(y):
-                    try:
-                        te_mat[i, j] = te.transfer_entropy(x, y, k=k)
-                    except Exception:
-                        te_mat[i, j] = 0
-    return pd.DataFrame(te_mat, index=cols, columns=cols)
-
-
-def monte_carlo_test(data, k=1, num_permutations=500, seed=0):
-    cols = data.columns
-    n = len(cols)
-    p_value_mat = np.zeros((n, n))
-    te_mat = transfer_entropy_matrix(data, k=k)
-    for i, xi in enumerate(cols):
-        for j, yj in enumerate(cols):
-            if i != j:
-                te_original = te_mat.iloc[i, j]
-                if te_original == 0:
-                    p_value_mat[i, j] = 1.0
-                    continue
-                te_permuted = np.zeros(num_permutations)
-                x_vals = data[xi].values.astype(int)
-                y_vals = data[yj].values.astype(int)
-                rng = np.random.default_rng(seed)
-                for t in range(num_permutations):
-                    y_perm = rng.permutation(y_vals)
-                    try:
-                        te_permuted[t] = te.transfer_entropy(x_vals, y_perm.astype(int), k=k)
-                    except Exception:
-                        te_permuted[t] = 0
-                r = int(np.sum(te_permuted >= te_original))
-                p_value_mat[i, j] = (r + 1) / (num_permutations + 1)
-    return pd.DataFrame(p_value_mat, index=cols, columns=cols)
-
-
-def _run_mc_config(ts_df, perms, seed, k=1):
-    p = monte_carlo_test(ts_df, k=k, num_permutations=perms, seed=seed)
-    return (perms, seed, p)
-
-
-def _distance_weighted_betweenness(G):
-    H = G.copy()
-    for _, _, d in H.edges(data=True):
-        w = d.get('weight', 0.0)
-        d['distance'] = 1.0 / w if w > 0 else float('inf')
-    return nx.betweenness_centrality(H, weight='distance')
-
-
 class TemporalAnalysis:
-
-    def __init__(self, config: dict):
+    def __init__(self, visualizer: AcademicVisualizer, config: dict):
+        self.viz = visualizer
         self.config = config['analysis']['temporal']
-        self.logger = logging.getLogger('MC-STM').getChild(self.__class__.__name__)
-        self._stable_edges = None
+        self.logger = logging.getLogger("MC-STM").getChild(self.__class__.__name__)
 
     def run(self, df: pd.DataFrame):
-        return {
-            'poisson_forecast': self.poisson_glm_forecast(df),
-            'te_stability': self.validate_te_stability(df),
-            'transfer_entropy': self.analyze_transfer_entropy(df),
-        }
+        """Run all temporal analysis tasks."""
+        self.logger.info("Starting temporal analysis...")
+        
+        # 2. Transfer Entropy Analysis
+        self.analyze_transfer_entropy(df)
+        
+        # 3. Categorical Temporal Evolution
+        self.plot_categorical_temporal_evolution(df)
+        
+        self.logger.info("Temporal analysis completed.")
 
-    def poisson_glm_forecast(self, df):
-        df_clean = df.copy()
-        df_clean['MonthDate'] = pd.to_datetime(dict(year=df_clean['Year'].astype(int), month=df_clean['Month'].astype(int), day=1), errors='coerce')
-        df_clean = df_clean.dropna(subset=['MonthDate'])
-        df_monthly = df_clean.groupby('MonthDate').size().rename('Count').reset_index()
-        df_monthly = df_monthly.rename(columns={'MonthDate': 'Month'})
-        df_monthly = df_monthly.set_index('Month').asfreq('MS', fill_value=0).reset_index()
-        t0 = df_monthly['Month'].min()
-        df_monthly['t'] = (df_monthly['Month'].dt.year - t0.year) * 12 + (df_monthly['Month'].dt.month - t0.month)
-        X = sm.add_constant(df_monthly[['t']])
-        y = df_monthly['Count'].astype(int)
-        try:
-            model = sm.GLM(y, X, family=sm.families.Poisson()).fit()
-            df_monthly['fitted_mean'] = model.predict(X)
-            forecast_len = self.config.get('forecast_months', 6)
-            last_month = df_monthly['Month'].max()
-            future_months = pd.date_range(last_month + pd.offsets.MonthBegin(1), periods=forecast_len, freq='MS')
-            df_f = pd.DataFrame({'Month': future_months})
-            df_f['t'] = (df_f['Month'].dt.year - t0.year) * 12 + (df_f['Month'].dt.month - t0.month)
-            Xf = sm.add_constant(df_f[['t']])
-            pred_res = model.get_prediction(Xf)
-            pred_sf = pred_res.summary_frame(alpha=0.05)
-            df_f['pred_mean'] = pred_sf['mean'].values
-            df_f['pred_lower'] = pred_sf['mean_ci_lower'].values
-            df_f['pred_upper'] = pred_sf['mean_ci_upper'].values
-            return {'model': model, 'monthly': df_monthly, 'forecast': df_f}
-        except Exception as e:
-            self.logger.error(f'Poisson GLM failed: {str(e)}')
-            return None
 
     def analyze_transfer_entropy(self, df):
-        ts_df = build_te_series(df)
+        """Analyze information transfer between categories following user snippet."""
+        # 1. Prepare categorical time series (2010-2025 counts)
+        columns = ['Target', 'Asset exploited', 'Cyber threats', 'Consequence severity', 
+                   'Consequence type', 'Intent', 'Origin']
+        years = np.arange(2010, 2026)
+        data_filtered = df[(df['Year'] >= 2010) & (df['Year'] <= 2025)].copy()
+        
+        series_dict = {}
+        for col in columns:
+            if col not in data_filtered.columns:
+                continue
+            # Use all categories as per Untitled-1.py
+            categories = data_filtered[col].value_counts().index
+            for cat in categories:
+                series_dict[f"{col}-{cat}"] = (
+                    data_filtered[data_filtered[col] == cat]['Year']
+                    .value_counts()
+                    .sort_index()
+                    .reindex(years, fill_value=0)
+                )
+        
+        ts_df = pd.DataFrame(series_dict)
         if ts_df.empty:
-            return None
+            return
+            
+        # Include 'All' column as per Untitled-1.py
+        ts_df['All'] = data_filtered['Year'].value_counts().sort_index().reindex(years, fill_value=0)
+
+        def transfer_entropy_matrix(data, k=1):
+            cols = data.columns
+            n = len(cols)
+            te_mat = np.zeros((n, n))
+            for i, xi in enumerate(cols):
+                for j, yj in enumerate(cols):
+                    if i != j:
+                        x = data[xi].values.astype(int)
+                        y = data[yj].values.astype(int)
+                        # Ensure data is not all zeros to avoid pyinform errors
+                        if np.any(x) and np.any(y):
+                            try:
+                                te_mat[i, j] = te.transfer_entropy(x, y, k=k)
+                            except:
+                                te_mat[i, j] = 0
+            return pd.DataFrame(te_mat, index=cols, columns=cols)
+
+        def monte_carlo_test(data, k=1, num_permutations=500):
+            cols = data.columns
+            n = len(cols)
+            p_value_mat = np.zeros((n, n))
+            te_mat = transfer_entropy_matrix(data, k=k)
+            
+            for i, xi in enumerate(cols):
+                for j, yj in enumerate(cols):
+                    if i != j:
+                        te_original = te_mat.iloc[i, j]
+                        if te_original == 0:
+                            p_value_mat[i, j] = 1.0
+                            continue
+                            
+                        te_permuted = np.zeros(num_permutations)
+                        x_vals = data[xi].values.astype(int)
+                        y_vals = data[yj].values.astype(int)
+                        for t in range(num_permutations):
+                            y_perm = np.random.permutation(y_vals)
+                            try:
+                                te_permuted[t] = te.transfer_entropy(x_vals, y_perm.astype(int), k=k)
+                            except:
+                                te_permuted[t] = 0
+                        p_value_mat[i, j] = np.mean(te_permuted >= te_original)
+            return pd.DataFrame(p_value_mat, index=cols, columns=cols)
+
+        self.logger.info(f"Computing Transfer Entropy matrix and Monte Carlo test ({len(ts_df.columns)} nodes)...")
+        np.random.seed(0)
         te_df = transfer_entropy_matrix(ts_df, k=1)
-        num_perms = 500
-        p_value_df = monte_carlo_test(ts_df, k=1, num_permutations=num_perms, seed=0)
+        # Using 1000 permutations for complete reporting as per user requirement
+        num_perms = 1000
+        p_value_df = monte_carlo_test(ts_df, k=1, num_permutations=num_perms)
+        
+        # Count significant edges (p < 0.05)
+        mask = ~np.eye(p_value_df.shape[0], dtype=bool)
+        sig_edges = (p_value_df < 0.05).values[mask].sum()
+        
+        self.logger.info(f"Transfer Entropy Significance Results ({num_perms} permutations):")
+        self.logger.info(f"- Significant edges (p < 0.05): {sig_edges}")
+        
+        # Save matrices
+        te_df.round(3).to_csv(os.path.join("output", "transfer_entropy_matrix.csv"))
+        p_value_df.round(3).to_csv(os.path.join("output", "transfer_entropy_p_values.csv"))
+        
+        # Detailed Reporting CSV
         detailed_te = []
         for i, src in enumerate(ts_df.columns):
             for j, dest in enumerate(ts_df.columns):
                 if i != j:
-                    detailed_te.append({'Source': src, 'Destination': dest, 'TE': round(te_df.iloc[i, j], 3), 'p_value': round(p_value_df.iloc[i, j], 3), 'Significant': p_value_df.iloc[i, j] < 0.05})
+                    detailed_te.append({
+                        "Source": src,
+                        "Destination": dest,
+                        "TE": round(te_df.iloc[i, j], 3),
+                        "p_value": round(p_value_df.iloc[i, j], 3),
+                        "Significant": p_value_df.iloc[i, j] < 0.05
+                    })
+        pd.DataFrame(detailed_te).to_csv(os.path.join("output", "transfer_entropy_detailed_report.csv"), index=False)
+
+        # Plot following user snippet exactly
+        plt.rcParams['font.size'] = 10
+        fig = plt.figure(figsize=(15, 8))
+        
+        im = plt.imshow(te_df, aspect='auto', cmap='viridis')
+        plt.colorbar(im, label='Transfer Entropy')
+        
+        plt.xticks(ticks=np.arange(0, te_df.shape[0]), labels=np.arange(0, te_df.shape[0]) + 1)
+        plt.yticks(ticks=np.arange(0, te_df.shape[0]), labels=np.arange(0, te_df.shape[0]) + 1)
+        
+        plt.xlabel('Target (To)')
+        plt.ylabel('Source (From)')
+        
+        handles = [plt.Line2D([0], [0], color="white", marker='s', linestyle="", 
+                               label=f"{i+1}: {lab}") for i, lab in enumerate(ts_df.columns)]
+        
+        plt.legend(handles=handles, title="Label", 
+                   bbox_to_anchor=(-0.7, 1), loc="upper left")
+        
+        plt.tight_layout()
+        self.viz.save_plot(fig, "Transfer Entropy", dpi=300)
+        
+        # 2. Network Visualization following user snippet exactly
         G = nx.DiGraph()
-        node_mapping = {i + 1: name for i, name in enumerate(ts_df.columns)}
+        node_mapping = {i+1: name for i, name in enumerate(ts_df.columns)}
         for idx in node_mapping.keys():
             G.add_node(idx)
+            
         for i in range(len(te_df)):
             for j in range(len(te_df)):
                 weight = te_df.iloc[i, j]
+                # Use raw p-values for the network graph
                 if i != j and p_value_df.iloc[i, j] < 0.05:
-                    if self._stable_edges is not None and (i, j) not in self._stable_edges:
-                        continue
-                    G.add_edge(i + 1, j + 1, weight=weight)
-        out_s = pd.Series(dict(G.out_degree(weight='weight'))).sort_index()
-        in_s = pd.Series(dict(G.in_degree(weight='weight'))).sort_index()
-        betweenness_s = pd.Series(_distance_weighted_betweenness(G)).sort_index()
-        return {
-            'te_matrix': te_df,
-            'p_values': p_value_df,
-            'edge_list': pd.DataFrame(detailed_te),
-            'graph': G,
-            'node_mapping': node_mapping,
-            'centrality': pd.DataFrame({
-                'Node': out_s.index,
-                'Label': [node_mapping.get(i, i) for i in out_s.index],
-                'Out_strength': out_s.values,
-                'In_strength': in_s.values,
-                'Betweenness': betweenness_s.values,
-            }),
-        }
+                    G.add_edge(i+1, j+1, weight=weight)
+        
+        if len(G.edges) > 0:
+            # 2a. Network Visualization following user snippet exactly
+            fig_net = plt.figure(figsize=(12, 8))
+            pos = nx.circular_layout(G)
+            
+            # Draw edges
+            nx.draw_networkx_edges(
+                G, pos,
+                arrowstyle="->", arrowsize=20,
+                edge_color="gray",
+                width=[d['weight'] for _, _, d in G.edges(data=True)]
+            )
+            
+            # Draw nodes (with digital ID)
+            nx.draw_networkx_nodes(G, pos, node_size=500, node_color="skyblue", alpha=0.7)
+            nx.draw_networkx_labels(
+                G, pos,
+                font_size=12,
+                font_family=self.viz.config['font_family'],
+                font_weight='bold',
+                font_color='black',
+            )
+            
+            # Legend at bottom
+            handles_net = [plt.Line2D([0], [0], color="white", marker='s', linestyle="", 
+                                      label=f"{i}: {lab}") for i, lab in node_mapping.items()]
+            
+            plt.legend(
+                handles=handles_net,
+                title="Label",
+                loc='upper center',
+                bbox_to_anchor=(0.5, -0.0),
+                ncol=3,
+                fontsize=10,
+                title_fontsize=12,
+                frameon=True,
+                borderaxespad=0.0
+            )
+            
+            plt.axis("off")
+            plt.tight_layout(rect=[0, 0, 1, 1])
+            self.viz.save_plot(fig_net, "Transfer Entropy Graph", dpi=900)
 
-    def validate_te_stability(self, df, alpha=0.05):
-        ts_df = build_te_series(df)
-        if ts_df.empty:
-            return None
-        seeds = self.config.get('stability_seeds', [0, 1, 42, 123, 2025])
-        perm_counts = self.config.get('stability_permutations', [200, 500, 1000])
-        reference_perms = self.config.get('reference_permutations', 1000)
-        n = len(ts_df.columns)
-        off_diag = [(i, j) for i in range(n) for j in range(n) if i != j]
-        ref_p = monte_carlo_test(ts_df, k=1, num_permutations=reference_perms, seed=0)
-        ref_sig = {(i, j) for i, j in off_diag if ref_p.iloc[i, j] < alpha}
-        configs = [(perms, seed) for perms in perm_counts for seed in seeds]
-        results = {}
-        try:
-            from concurrent.futures import ProcessPoolExecutor
-            with ProcessPoolExecutor(max_workers=min(len(configs), os.cpu_count() or 1)) as ex:
-                futures = {ex.submit(_run_mc_config, ts_df, p, s): (p, s) for p, s in configs}
-                for fut in futures:
-                    p, s = futures[fut]
-                    results[p, s] = fut.result()[2]
-        except Exception as e:
-            self.logger.warning(f'Parallel stability run failed ({e}); falling back to sequential.')
-            results = {cfg: monte_carlo_test(ts_df, k=1, num_permutations=cfg[0], seed=cfg[1]) for cfg in configs}
-        records = []
-        jaccard_rows = []
-        for (perms, seed), p in results.items():
-            sig = {(i, j) for i, j in off_diag if p.iloc[i, j] < alpha}
-            jac = len(sig & ref_sig) / len(sig | ref_sig) if sig | ref_sig else 1.0
-            jaccard_rows.append({'permutations': perms, 'seed': seed, 'n_significant': len(sig), 'jaccard_vs_reference': round(jac, 4)})
-            for i, j in off_diag:
-                records.append({'permutations': perms, 'seed': seed, 'source': ts_df.columns[i], 'target': ts_df.columns[j], 'p_value': round(p.iloc[i, j], 4), 'significant': p.iloc[i, j] < alpha})
-        detail_df = pd.DataFrame(records)
-        jaccard_df = pd.DataFrame(jaccard_rows)
-        stab = detail_df.groupby(['source', 'target'])['significant'].agg(['sum', 'count'])
-        stab['stability'] = (stab['sum'] / stab['count']).round(4)
-        stab = stab.reset_index().rename(columns={'sum': 'times_significant', 'count': 'times_tested'})
-        stab = stab.sort_values(['stability', 'times_significant'], ascending=False).reset_index(drop=True)
-        jac_summary = jaccard_df.groupby('permutations')['jaccard_vs_reference'].agg(['mean', 'min', 'max']).round(4).reset_index()
-        self._stable_edges = set()
-        for _, row in stab[stab['stability'] == 1.0].iterrows():
-            si = ts_df.columns.get_loc(row['source'])
-            sj = ts_df.columns.get_loc(row['target'])
-            self._stable_edges.add((si, sj))
-        return {
-            'detail': detail_df,
-            'jaccard': jaccard_df,
-            'edge_stability': stab,
-            'jaccard_summary': jac_summary,
-            'avg_jaccard': jaccard_df['jaccard_vs_reference'].mean(),
-            'stable_edges': self._stable_edges,
-        }
+            # 2b. Radar Chart following user snippet exactly
+            def _series_to_radar(ax, s, title="", normalize=True):
+                s = s.sort_index()
+                labels = s.index.astype(str).tolist()
+                values = s.values.astype(float)
+
+                if normalize:
+                    vmin, vmax = float(np.min(values)), float(np.max(values))
+                    if vmax > vmin:
+                        values = (values - vmin) / (vmax - vmin)
+                    else:
+                        values = np.zeros_like(values)
+                    r_ticks = [0.25, 0.5, 0.75, 1]
+                    r_ticklabels = ["0.25","0.50","0.75",""]
+                    r_lim = (0, 1)
+                else:
+                    upper = float(np.max(values))
+                    r_lim = (0, upper * 1.05 if upper > 0 else 1.0)
+                    r_ticks = np.linspace(r_lim[0], r_lim[1], 5)[1:]
+                    r_ticklabels = [f"{t:.2g}" for t in r_ticks]
+                    r_ticklabels[-1] = ""
+
+                N = len(labels)
+                angles = np.linspace(0, 2*np.pi, N, endpoint=False).tolist()
+                angles += angles[:1]
+                vals_closed = np.concatenate([values, values[:1]])
+
+                ax.set_theta_offset(np.pi / 2)
+                ax.set_theta_direction(-1)
+                ax.set_xticks(angles[:-1])
+                ax.set_xticklabels(labels, fontsize=12)
+                ax.set_ylim(*r_lim)
+                ax.set_yticks(r_ticks)
+                ax.set_yticklabels(r_ticklabels, fontsize=12)
+                ax.plot(angles, vals_closed, linewidth=2)
+                ax.fill(angles, vals_closed, alpha=0.10)
+                ax.set_title(title, fontsize=12, pad=20, loc="center", y=-0.25)
+                plt.tight_layout()
+
+            out_strength = dict(G.out_degree(weight="weight"))
+            in_strength = dict(G.in_degree(weight="weight"))
+            betweenness = nx.betweenness_centrality(G, weight="weight")
+
+            out_s = pd.Series(out_strength).sort_index()
+            in_s = pd.Series(in_strength).sort_index()
+            betweenness_s = pd.Series(betweenness).sort_index()
+
+            fig_radar = plt.figure(figsize=(12, 4))
+            ax1 = plt.subplot(1, 3, 1, polar=True)
+            _series_to_radar(ax1, out_s, title="(a) Out-strength", normalize=False)
+            ax2 = plt.subplot(1, 3, 2, polar=True)
+            _series_to_radar(ax2, in_s, title="(b) In-strength", normalize=False)
+            ax3 = plt.subplot(1, 3, 3, polar=True)
+            _series_to_radar(ax3, betweenness_s, title="(c) Betweenness", normalize=False)
+            
+            plt.tight_layout()
+            self.viz.save_plot(fig_radar, "Transfer Entropy Graph Radar", dpi=300)
+
+    def plot_categorical_temporal_evolution(self, df):
+        """Plot temporal evolution for categorical features following user snippet."""
+        columns = ['Target', 'Asset exploited', 'Cyber threats', 'Consequence severity', 
+                   'Consequence type', 'Intent', 'Origin']
+        
+        # Filter data for 2010-2025 as per snippet
+        years = np.arange(2010, 2026)
+        data = df[(df['Year'] >= 2010) & (df['Year'] <= 2025)].copy()
+        
+        all_year = data['Year'].value_counts().sort_index().reindex(years, fill_value=0)
+        col_year = {}
+        
+        import matplotlib
+        ncols = 3
+        nrows = int(np.ceil(len(columns) / ncols))
+        
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 4*nrows))
+        axes = axes.flatten()
+        
+        for idx, col in enumerate(columns):
+            if col not in data.columns:
+                continue
+                
+            ax = axes[idx]
+            categories = data[col].value_counts().index
+            
+            # Use tab20b or fallback to tab20
+            try:
+                cmap = matplotlib.colormaps["tab20b"].resampled(len(categories))
+            except:
+                cmap = matplotlib.colormaps["tab20"].resampled(len(categories))
+
+            for j, cat in enumerate(categories):
+                series = (
+                    data[data[col] == cat]['Year']
+                    .value_counts()
+                    .sort_index()
+                    .reindex(years, fill_value=0)
+                )
+                col_year[col + '-' + str(cat)] = series
+                
+                ax.plot([str(_) for _ in years], 
+                        series.values, 
+                        marker='o', 
+                        linewidth=1.5, 
+                        color=cmap(j),
+                        label=cat)
+            
+            ax.tick_params(axis='x', rotation=45)
+            ax.set_xlabel('Year')
+            ax.set_ylabel('Counts')
+            # Adjust legend font size to be smaller for complex plots
+            ax.legend(loc="upper left", title=col, fontsize=8, title_fontsize=9)
+            self.viz.apply_academic_spines(ax)
+
+        # Remove extra subplots
+        for k in range(len(columns), len(axes)):
+            fig.delaxes(axes[k])
+            
+        plt.tight_layout()
+        self.viz.save_plot(fig, "time", dpi=1200)
+        
+        # Save results to CSV
+        col_year['All'] = all_year
+        res_df = pd.DataFrame(col_year)
+        output_csv = os.path.join("output", "categorical_temporal_counts.csv")
+        res_df.to_csv(output_csv)
+        self.logger.info(f"Categorical temporal counts saved to {output_csv}")

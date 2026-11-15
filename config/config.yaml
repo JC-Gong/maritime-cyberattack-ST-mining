@@ -14,9 +14,6 @@ analysis:
   temporal:
     forecast_months: 6
     glm_family: "Poisson"
-    stability_seeds: [0, 1, 42, 123, 2025]
-    stability_permutations: [500]
-    reference_permutations: 500
   spatial:
     knn_k: 9
     crs: "EPSG:3857" # Web Mercator for metric distance
